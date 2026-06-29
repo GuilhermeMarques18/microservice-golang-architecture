@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+option go_package = "github.com/GuilhermeMarques18/microservice-golang-architecture/gen/go/process/v1;process";
+
+service ComputerService {
+  rpc ProcessData(ProcessDataRequest) returns (ProcessDataResponse) {}
+}
+
+message ProcessDataRequest {
+  string request_id = 1;
+  bytes payload = 2;
+  int32 complexity = 3;
+}
+
+message ProcessDataResponse{
+  string request_id = 1;
+  bytes result_hash = 2;
+  int64 processing_time_ms = 3;
+}
