@@ -1,19 +1,30 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/GuilhermeMarques18/microservice-golang-architecture/api-gateway/dto"
+	pb "github.com/GuilhermeMarques18/microservice-golang-architecture/gen/go/process/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-type ProcessRequestDTO struct {
-	RequestID  string `json:"request_id"`
-	Payload    []byte `json:"payload"`
-	Complexity int32  `json:"complexity"`
+type Gateway struct {
+	client pb.ComputerServiceClient
+	logger *slog.Logger
 }
 
-func HandlerProtect(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) HandlerProtect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método inválido", http.StatusMethodNotAllowed)
 		return
@@ -25,24 +36,85 @@ func HandlerProtect(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 
-	var dto ProcessRequestDTO
-	if err := dec.Decode(&dto); err != nil {
+	var reqDTO dto.ProcessRequestDTO
+	if err := dec.Decode(&reqDTO); err != nil {
 		http.Error(w, "JSON inválido: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	fmt.Printf(" RequestID: %s | Complexidade: %d | Payload(bytes): %d\n",
-		dto.RequestID, dto.Complexity, len(dto.Payload))
+	if err := reqDTO.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	g.logger.Info("Request recebido", "Request_id", reqDTO.RequestID, "Complexity", reqDTO.Complexity, "Payload_bytes", len(reqDTO.Payload))
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	response, err := g.client.ProcessData(ctx, &pb.ProcessDataRequest{
+		RequestId:  reqDTO.RequestID,
+		Complexity: reqDTO.Complexity,
+		Payload:    reqDTO.Payload,
+	})
+
+	if err != nil {
+		st, _ := status.FromError(err)
+		switch st.Code() {
+		case codes.DeadlineExceeded:
+			http.Error(w, "Tempo limite de processamento excedido", http.StatusGatewayTimeout)
+		default:
+			http.Error(w, "Erro interno do servidor", http.StatusBadGateway)
+		}
+		return
+	}
+
+	b, err := protojson.Marshal(response)
+	if err != nil {
+		g.logger.Error("falha ao serializar resposta", "request_id", reqDTO.RequestID, "error", err)
+		http.Error(w, "erro interno", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
+	w.WriteHeader(http.StatusOK)
+	w.Write(b)
 
 }
 
-func main() {
-	mux := http.NewServeMux()
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
 
-	mux.HandleFunc("/process", HandlerProtect)
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	processorAddr := os.Getenv("PROCESSOR_ADDR")
+	if processorAddr == "" {
+		processorAddr = "compute-processor:50051"
+	}
+
+	conn, err := grpc.NewClient(
+		"dns:///"+processorAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
+	)
+
+	if err != nil {
+		logger.Error("falha ao conectar no processor", "error", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	gw := &Gateway{
+		client: pb.NewComputerServiceClient(conn),
+		logger: logger,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/process", gw.HandlerProtect)
+	mux.HandleFunc("/health", healthHandler)
 
 	s := &http.Server{
 		Addr:              ":8080",
@@ -53,9 +125,24 @@ func main() {
 		IdleTimeout:       100 * time.Second,
 	}
 
-	fmt.Println("Servidor iniciado na porta 8080")
-	if err := s.ListenAndServe(); err != nil {
-		fmt.Printf("Erro ao iniciar o servidor: %v\n", err)
-	}
+	go func() {
+		logger.Info("servidor iniciado", "port", 8080)
+		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("erro ao iniciar servidor", "error", err)
+			os.Exit(1)
+		}
+	}()
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	<-ctx.Done()
+
+	logger.Info("sinal de shutdown recebido, encerrando graciosamente...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := s.Shutdown(shutdownCtx); err != nil {
+		logger.Error("erro no shutdown", "error", err)
+	}
 }
