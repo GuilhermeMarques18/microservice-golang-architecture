@@ -1,4 +1,184 @@
-name: workflow.yml
+name: CI/CD
+
 on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -buildvcs=false
 
 jobs:
+  quality:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l api-gateway compute-process gen)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build ./...
+
+  kubernetes:
+    name: Kubernetes Manifests
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Render manifests
+        run: kubectl kustomize k8s > /tmp/k8s-rendered.yaml
+
+      - name: Validate manifests
+        run: kubectl apply --dry-run=client --validate=false -f /tmp/k8s-rendered.yaml
+
+  container-images:
+    name: Container Images
+    runs-on: ubuntu-latest
+    needs:
+      - quality
+      - kubernetes
+    env:
+      SHOULD_PUSH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+    outputs:
+      gateway-image: ${{ steps.images.outputs.gateway }}
+      processor-image: ${{ steps.images.outputs.processor }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image names
+        id: images
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "gateway=ghcr.io/${repo}/api-gateway" >> "$GITHUB_OUTPUT"
+          echo "processor=ghcr.io/${repo}/compute-processor" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: env.SHOULD_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Gateway metadata
+        id: gateway-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.gateway }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+
+      - name: Processor metadata
+        id: processor-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.processor }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+
+      - name: Build gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: api-gateway/Dockerfile
+          push: ${{ env.SHOULD_PUSH == 'true' }}
+          tags: ${{ steps.gateway-meta.outputs.tags }}
+          labels: ${{ steps.gateway-meta.outputs.labels }}
+          cache-from: type=gha,scope=api-gateway
+          cache-to: type=gha,mode=max,scope=api-gateway
+
+      - name: Build processor image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: compute-process/Dockerfile
+          push: ${{ env.SHOULD_PUSH == 'true' }}
+          tags: ${{ steps.processor-meta.outputs.tags }}
+          labels: ${{ steps.processor-meta.outputs.labels }}
+          cache-from: type=gha,scope=compute-processor
+          cache-to: type=gha,mode=max,scope=compute-processor
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: container-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      GATEWAY_IMAGE: ${{ needs.container-images.outputs.gateway-image }}
+      PROCESSOR_IMAGE: ${{ needs.container-images.outputs.processor-image }}
+    steps:
+      - name: Skip without kubeconfig
+        if: env.KUBE_CONFIG == ''
+        run: echo "KUBE_CONFIG secret not configured. Images were built and published, deploy skipped."
+
+      - name: Checkout
+        if: env.KUBE_CONFIG != ''
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        if: env.KUBE_CONFIG != ''
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        if: env.KUBE_CONFIG != ''
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Deploy to Kubernetes
+        if: env.KUBE_CONFIG != ''
+        run: |
+          cd k8s
+          kubectl kustomize . > /tmp/k8s-rendered.yaml
+          kubectl set image \
+            -f /tmp/k8s-rendered.yaml \
+            api-gateway="$GATEWAY_IMAGE:$GITHUB_SHA" \
+            compute-processor="$PROCESSOR_IMAGE:$GITHUB_SHA" \
+            --local -o yaml | kubectl apply -f -
