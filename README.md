@@ -1,6 +1,6 @@
-# 🚀 Microservice Golang Architecture (Compute Processor)
+# Microservice Golang Architecture (Compute Processor)
 
-## 🏗️ Arquitetura
+##  Arquitetura
 
 O projeto é dividido em dois microsserviços principais:
 
@@ -43,7 +43,6 @@ kubectl apply -f k8s/metrics-server.yaml
 Aplique todos os manifestos de infraestrutura (Deployments, Services e HPAs):
 
 ```bash
-# Se os arquivos estiverem em uma pasta k8s/
 kubectl apply -f k8s/
 ```
 
